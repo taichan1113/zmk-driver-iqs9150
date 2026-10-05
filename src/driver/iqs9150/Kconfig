@@ -1,0 +1,17 @@
+menuconfig IQS9150_EV02_DRIVER
+    bool "IQS9150 EV02 sensor driver"
+    default y
+    depends on DT_HAS_AZOTEQ_IQS9150_ENABLED
+    select I2C
+    help
+      Initialize IQS9150 EV02 on the active-low RDY interrupt, then publish
+      normalized absolute contact frames. Pointer and gesture policies are
+      implemented by separate Travelers Pad function modules.
+
+if IQS9150_EV02_DRIVER
+
+module = IQS9150_EV02_DRIVER
+module-str = iqs9150_ev02_driver
+source "subsys/logging/Kconfig.template.log_config"
+
+endif
