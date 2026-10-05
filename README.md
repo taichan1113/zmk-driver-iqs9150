@@ -12,12 +12,12 @@ I2C/RDY・初期化/ATI/復旧・接触frameを担当し、操作ポリシーは
 Add this project to west at `module/zmk-driver-iqs9150`. Define an enabled
 `azoteq,iqs9150` I2C node with `reg = <0x56>` and active-low `rdy-gpios` in the
 keyboard overlay. Set `CONFIG_IQS9150_EV02_DRIVER=y`. No shield or keymap is supplied.
-For mouse behavior, additionally import `zmk-input-travelers-pad`.
+For mouse behavior, additionally import `zmk-features-trackpad`.
 
 westで本projectを`module/zmk-driver-iqs9150`へ取り込む。キーボードoverlayで
 `azoteq,iqs9150` I2C node、アドレス0x56、active-lowのrdy-gpiosを定義し、
 上記CONFIGを有効にする。shield・keymapは提供しない。
-マウス操作には別途`zmk-input-travelers-pad`を取り込む。
+マウス操作には別途`zmk-features-trackpad`を取り込む。
 
 `include/travelers_pad/multitouch.h` is the shared contact-frame contract and
 must have one owner; do not duplicate it in the function module. This driver
