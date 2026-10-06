@@ -19,6 +19,9 @@
  * MSC_SCAN is private to this internal device chain; it is never host-facing
  * and carries the arbiter frame sequence needed to validate later REL output. */
 #define TRAVELERS_PAD_INPUT_MSC_ROUTED_FRAME_SEQ 0x04
+/* Rebase legacy motion without cancelling the contact session.
+ * 接触sessionをキャンセルせずlegacy移動基準を更新する。 */
+#define TRAVELERS_PAD_INPUT_MSC_CONTACT_REFERENCE_CHANGED 0x05
 
 #define TRAVELERS_PAD_MAX_CONTACTS 7
 

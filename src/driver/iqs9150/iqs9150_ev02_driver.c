@@ -125,6 +125,8 @@ struct iqs9150_data {
 	int64_t last_two_finger_log_ms;
 	int64_t last_multitouch_log_ms;
 	bool multitouch_slot_active[TRAVELERS_PAD_MAX_CONTACTS];
+	uint8_t representative_slot;
+	bool representative_valid;
 	size_t block_index;
 	size_t block_offset;
 };
@@ -251,6 +253,7 @@ static void report_reset_frame(const struct device *dev)
 	int rc;
 
 	struct iqs9150_data *data = dev->data;
+	data->representative_valid = false;
 
 	rc = 0;
 	for (uint8_t index = 0; index < TRAVELERS_PAD_MAX_CONTACTS; index++) {
@@ -285,6 +288,38 @@ static void iqs9150_start_runtime_recovery(struct iqs9150_data *data, const char
 	data->state = sensor_already_reset ? IQS9150_ACK_RESET : IQS9150_RECOVER_RESET;
 }
 
+/* Count is not a slot-index limit: fingers retain memory locations (7.2.6).
+ * 接触数はslot indexの上限ではない。指は元のメモリ位置に残る。 */
+static uint8_t decode_contact_slots(const uint8_t *report, uint16_t flags,
+				   struct iqs9150_contact *contacts)
+{
+	uint8_t count = 0;
+	for (uint8_t index = 0; index < TRAVELERS_PAD_MAX_CONTACTS; index++) {
+		uint16_t offset = IQS9150_REPORT_FINGER_OFFSET(index);
+		contacts[index].x = le16(&report[offset]);
+		contacts[index].y = le16(&report[offset + 2]);
+		contacts[index].valid = (flags & IQS9150_TP_FINGER_COUNT_MASK) != 0 &&
+			(flags & IQS9150_TP_FINGER_CONFIDENCE(index)) &&
+			contacts[index].x != UINT16_MAX && contacts[index].y != UINT16_MAX;
+		count += contacts[index].valid;
+	}
+	return count;
+}
+
+static uint8_t contact_representative(const struct iqs9150_contact *contacts,
+				      uint8_t previous, bool have_previous)
+{
+	if (have_previous && previous < TRAVELERS_PAD_MAX_CONTACTS && contacts[previous].valid) {
+		return previous;
+	}
+	for (uint8_t index = 0; index < TRAVELERS_PAD_MAX_CONTACTS; index++) {
+		if (contacts[index].valid) {
+			return index;
+		}
+	}
+	return TRAVELERS_PAD_MAX_CONTACTS;
+}
+
 static void report_contact_frame(const struct device *dev)
 {
 	struct iqs9150_data *data = dev->data;
@@ -293,7 +328,6 @@ static void report_contact_frame(const struct device *dev)
 	uint8_t gestures_1f;
 	uint8_t gestures_2f;
 	uint8_t fingers;
-	uint8_t reported_fingers;
 	uint16_t trackpad_flags;
 	struct iqs9150_contact contacts[TRAVELERS_PAD_MAX_CONTACTS];
 	const struct iqs9150_config *cfg = dev->config;
@@ -324,17 +358,7 @@ static void report_contact_frame(const struct device *dev)
 	}
 
 	trackpad_flags = le16(&report[14]);
-	reported_fingers = trackpad_flags & IQS9150_TP_FINGER_COUNT_MASK;
-	fingers = MIN(reported_fingers, (uint8_t)TRAVELERS_PAD_MAX_CONTACTS);
-	for (uint8_t index = 0; index < TRAVELERS_PAD_MAX_CONTACTS; index++) {
-		uint16_t offset = IQS9150_REPORT_FINGER_OFFSET(index);
-
-		contacts[index].x = le16(&report[offset]);
-		contacts[index].y = le16(&report[offset + 2]);
-		contacts[index].valid = index < fingers &&
-			(trackpad_flags & IQS9150_TP_FINGER_CONFIDENCE(index)) &&
-			contacts[index].x != UINT16_MAX && contacts[index].y != UINT16_MAX;
-	}
+	fingers = decode_contact_slots(report, trackpad_flags, contacts);
 
 	LOG_DBG("status=0x%04x tp=0x%04x fingers=%u rel=(%d,%d) f1=(%u,%u,%d) f2=(%u,%u,%d)",
 		le16(&report[12]), trackpad_flags, fingers, (int16_t)le16(&report[0]),
@@ -376,10 +400,9 @@ static void report_contact_frame(const struct device *dev)
 		data->last_multitouch_log_ms = k_uptime_get();
 	}
 
-	/* Publish every contact in a slot frame for gesture modules. The legacy
-	 * fields immediately below remain unchanged for the existing pointer
-	 * function: two-finger scroll uses only the representative Finger 1 delta,
-	 * while pinch/rotation modules consume the slot geometry. */
+	/* Keep physical slots/identities; legacy fields select valid representatives
+	 * rather than assuming active slots occupy a contiguous prefix.
+	 * 物理slot/IDを維持し、legacy座標は有効な代表指から選ぶ。 */
 	rc = 0;
 	for (uint8_t index = 0; index < TRAVELERS_PAD_MAX_CONTACTS; index++) {
 		if (!contacts[index].valid && !data->multitouch_slot_active[index]) {
@@ -398,13 +421,27 @@ static void report_contact_frame(const struct device *dev)
 					       contacts[index].y, false, K_NO_WAIT);
 		}
 	}
-	/* Legacy compatibility frame: ABS_X/Y is Finger 1; ABS_RX/RY is Finger 2;
-	 * ABS_RUDDER is Finger 2 validity; ABS_Z is the contact count. */
-	rc |= input_report_abs(dev, INPUT_ABS_X, contacts[0].x, false, K_NO_WAIT);
-	rc |= input_report_abs(dev, INPUT_ABS_Y, contacts[0].y, false, K_NO_WAIT);
-	rc |= input_report_abs(dev, INPUT_ABS_RX, contacts[1].x, false, K_NO_WAIT);
-	rc |= input_report_abs(dev, INPUT_ABS_RY, contacts[1].y, false, K_NO_WAIT);
-	rc |= input_report_abs(dev, INPUT_ABS_RUDDER, contacts[1].valid, false, K_NO_WAIT);
+	/* ABS_X/Y is the stable representative; ABS_RX/RY is another active contact.
+	 * ABS_RUDDER marks the second representative; ABS_Z counts valid slots. */
+	uint8_t first = contact_representative(contacts, data->representative_slot,
+					     data->representative_valid);
+	uint8_t second = TRAVELERS_PAD_MAX_CONTACTS;
+	for (uint8_t index = 0; index < TRAVELERS_PAD_MAX_CONTACTS; index++) {
+		if (contacts[index].valid && index != first) {
+			second = index;
+			break;
+		}
+	}
+	bool changed = fingers != 0 && data->representative_valid && first != data->representative_slot;
+	rc |= input_report(dev, INPUT_EV_MSC, TRAVELERS_PAD_INPUT_MSC_CONTACT_REFERENCE_CHANGED,
+			   changed, false, K_NO_WAIT);
+	data->representative_slot = first;
+	data->representative_valid = fingers != 0;
+	rc |= input_report_abs(dev, INPUT_ABS_X, fingers ? contacts[first].x : UINT16_MAX, false, K_NO_WAIT);
+	rc |= input_report_abs(dev, INPUT_ABS_Y, fingers ? contacts[first].y : UINT16_MAX, false, K_NO_WAIT);
+	rc |= input_report_abs(dev, INPUT_ABS_RX, second < TRAVELERS_PAD_MAX_CONTACTS ? contacts[second].x : UINT16_MAX, false, K_NO_WAIT);
+	rc |= input_report_abs(dev, INPUT_ABS_RY, second < TRAVELERS_PAD_MAX_CONTACTS ? contacts[second].y : UINT16_MAX, false, K_NO_WAIT);
+	rc |= input_report_abs(dev, INPUT_ABS_RUDDER, second < TRAVELERS_PAD_MAX_CONTACTS, false, K_NO_WAIT);
 	rc |= input_report_abs(dev, INPUT_ABS_Z, fingers, false, K_NO_WAIT);
 	rc |= input_report_key(dev, INPUT_BTN_TOUCH, fingers != 0, true, K_NO_WAIT);
 	if (rc != 0) {
