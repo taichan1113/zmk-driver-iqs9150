@@ -20,6 +20,7 @@
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/sys/util.h>
+#include <zephyr/sys/atomic.h>
 
 #include "iqs9150_ev02_init.h"
 #include <travelers_pad/multitouch.h>
@@ -41,7 +42,9 @@ LOG_MODULE_REGISTER(iqs9150_ev02_driver, CONFIG_IQS9150_EV02_DRIVER_LOG_LEVEL);
 #define IQS9150_SYSTEM_CONTROL_ACK_RESET  BIT(7)
 #define IQS9150_SYSTEM_CONTROL_ALP_REATI  BIT(6)
 #define IQS9150_SYSTEM_CONTROL_TP_REATI   BIT(5)
-#define IQS9150_SYSTEM_CONTROL_SW_RESET    BIT(1)
+#define IQS9150_SYSTEM_CONTROL_SW_RESET    BIT(9)
+#define IQS9150_RESET_VERIFY_TIMEOUT_MS    2000
+#define IQS9150_RESET_REQUEST_RETRY_MAX    3
 
 #define IQS9150_INFO_TP_ATI_ERROR          BIT(3)
 #define IQS9150_INFO_TP_REATI_OCCURRED     BIT(4)
@@ -93,17 +96,29 @@ struct iqs9150_config {
 	struct gpio_dt_spec rdy_gpio;
 	bool two_finger_diagnostics;
 	bool multitouch_diagnostics;
+ uint16_t rdy_watch_ms;
+ bool runtime_diagnostics;
 };
 
 struct iqs9150_data {
 	const struct device *dev;
 	struct gpio_callback rdy_callback;
 	struct k_work_delayable work;
+ struct k_work_delayable rdy_watch_work;
+ atomic_t rdy_irq_count;
+ uint32_t reports_read;
+ uint32_t rdy_rescues;
+ int64_t last_report_ms;
+ int64_t last_watch_log_ms;
+ int64_t last_rescue_log_ms;
 	enum iqs9150_state state;
 	uint8_t ack_attempts;
 	uint8_t report_error_count;
 	uint8_t product_attempts;
 	uint8_t ati_recovery_attempts;
+ uint8_t reset_request_attempts;
+ int64_t reset_requested_ms;
+ int64_t last_reset_wait_log_ms;
 	bool terminate_comms_window;
 	int64_t last_two_finger_log_ms;
 	int64_t last_multitouch_log_ms;
@@ -204,12 +219,10 @@ static int write_reg(const struct device *dev, uint16_t reg, const uint8_t *data
 	return i2c_write_dt(&cfg->i2c, buffer, len + 2);
 }
 
-/* When Config Settings bit 6 is set, STOP alone does not end a communication
- * window. The EV02 GUI image enables this bit (0x461E), so explicitly write
- * the documented 0xEEEE terminator after every completed transaction.
- * Config Settingsのbit 6が有効な場合、STOPだけでは通信窓が終了しない。
- * EV02 GUI設定(0x461E)はこのbitを有効にするため、各トランザクション後に
- * 規定の0xEEEE終了コマンドを書き込む。 */
+/* Config Settings bit 6 is in the LOW byte. The EV02 value 0x461E
+ * leaves it clear: STOP ends the window. Bit 14 is Switch Event Enable.
+ * Config Settingsのbit 6は下位byte。0x461Eでは0で、STOPで通信窓が終了する。
+ * 上位byteのbit 6（word bit 14）はSwitch Event Enableである。 */
 static int terminate_comms_if_needed(const struct iqs9150_data *data)
 {
 	const struct iqs9150_config *cfg = data->dev->config;
@@ -263,6 +276,7 @@ static void iqs9150_start_runtime_recovery(struct iqs9150_data *data, const char
 	report_reset_frame(data->dev);
 	data->ack_attempts = 0;
 	data->report_error_count = 0;
+ data->reset_request_attempts = 0;
 	data->block_index = 0;
 	data->block_offset = 0;
 	data->state = sensor_already_reset ? IQS9150_ACK_RESET : IQS9150_RECOVER_RESET;
@@ -292,9 +306,15 @@ static void report_contact_frame(const struct device *dev)
 	rc = terminate_comms_if_needed(data);
 	if (rc != 0) {
 		LOG_ERR("report communication termination failed: %d", rc);
+  data->report_error_count++;
+  if (data->report_error_count >= IQS9150_REPORT_ERROR_RETRY_MAX) {
+   iqs9150_start_runtime_recovery(data, "consecutive termination failures", false);
+  }
 		return;
 	}
 	data->report_error_count = 0;
+ data->reports_read++;
+ data->last_report_ms = k_uptime_get();
 	if (le16(&report[12]) & IQS9150_INFO_SHOW_RESET) {
 		iqs9150_start_runtime_recovery(data, "sensor Show Reset flag", true);
 		return;
@@ -403,6 +423,14 @@ static void iqs9150_work_handler(struct k_work *work)
 	uint8_t value[4] = {0};
 	int rc;
 
+ /* Do not force register transactions between communication windows.
+  * WAIT_PRODUCT retains the startup probe; reset timeout is handled below.
+  * RDY窓外にレジスタ通信を強制しない。製品probeとreset timeoutは別扱い。 */
+ if (data->state != IQS9150_WAIT_PRODUCT && data->state != IQS9150_ERROR &&
+     data->state != IQS9150_RECOVER_RESET && data->state != IQS9150_RECOVER_WAIT_RESET &&
+     gpio_pin_get_dt(&((const struct iqs9150_config *)dev->config)->rdy_gpio) != 1)
+  return;
+
 	switch (data->state) {
 	case IQS9150_WAIT_PRODUCT:
 		rc = read_reg(dev, IQS9150_PRODUCT_NUMBER_REG, value, 2);
@@ -418,7 +446,7 @@ static void iqs9150_work_handler(struct k_work *work)
 			 * occur in an RDY window. / Config Settings読出しと次のSystem
 			 * Control書込みはRDYウィンドウ内で実行する。 */
 			if (gpio_pin_get_dt(&((const struct iqs9150_config *)dev->config)->rdy_gpio) ==
-			    0) {
+			    1) {
 				k_work_schedule(&data->work, K_NO_WAIT);
 			}
 			return;
@@ -442,7 +470,7 @@ static void iqs9150_work_handler(struct k_work *work)
 			iqs9150_fail(data, "Config Settings read", rc);
 			return;
 		}
-		data->terminate_comms_window = (value[1] & BIT(6)) != 0;
+		data->terminate_comms_window = (value[0] & BIT(6)) != 0;
 		rc = terminate_comms_if_needed(data);
 		if (rc != 0) {
 			iqs9150_fail(data, "Config Settings communication termination", rc);
@@ -522,7 +550,7 @@ static void iqs9150_work_handler(struct k_work *work)
 		/* The write to Config Settings changes termination semantics for
 		 * this very communication session. */
 		if (block->reg + data->block_offset == IQS9150_CONFIG_SETTINGS_REG) {
-			data->terminate_comms_window = (block->data[data->block_offset + 1] & BIT(6)) != 0;
+			data->terminate_comms_window = (block->data[data->block_offset] & BIT(6)) != 0;
 		}
 		rc = terminate_comms_if_needed(data);
 		if (rc != 0) {
@@ -610,7 +638,7 @@ static void iqs9150_work_handler(struct k_work *work)
 			iqs9150_fail(data, "Event Mode enable", rc);
 			return;
 		}
-		data->terminate_comms_window = (value[1] & BIT(6)) != 0;
+		data->terminate_comms_window = (value[0] & BIT(6)) != 0;
 		rc = terminate_comms_if_needed(data);
 		if (rc != 0) {
 			iqs9150_fail(data, "Event Mode communication termination", rc);
@@ -622,6 +650,11 @@ static void iqs9150_work_handler(struct k_work *work)
 		return;
 
 	case IQS9150_RUNNING:
+  /* gpio_pin_get_dt returns logical active=1 for GPIO_ACTIVE_LOW.
+   * A queued duplicate IRQ must not force communication outside RDY.
+   * active-lowでも論理有効は1。重複workでRDY外へアクセスしない。 */
+  if (gpio_pin_get_dt(&((const struct iqs9150_config *)dev->config)->rdy_gpio) != 1)
+   return;
 		report_contact_frame(dev);
 		return;
 
@@ -632,19 +665,18 @@ static void iqs9150_work_handler(struct k_work *work)
 		 * 遅延した起動ATI recoveryはRDY window外で起き得る。System Controlの書込み前に
 		 * active-low RDY windowを待ち、recovery transactionも起動時と同じprotocol
 		 * timingに従わせる。 */
-		if (gpio_pin_get_dt(&((const struct iqs9150_config *)dev->config)->rdy_gpio) != 0) {
+		if (gpio_pin_get_dt(&((const struct iqs9150_config *)dev->config)->rdy_gpio) != 1) {
 			k_work_schedule(&data->work, K_MSEC(IQS9150_PRODUCT_RETRY_INTERVAL_MS));
 			return;
 		}
 		/* Reset only after a failed report sequence. A sensor-originated reset
 		 * already has Show Reset asserted, so it can go straight to ACK on the
 		 * following RDY window. */
-		/* System Control is little-endian. SW_RESET is bit 1 of the low
-		 * byte, hence the complete command is 0x0002, not 0x0200.
-		 * System Controlはlittle-endianである。SW_RESETは下位byteのbit 1なので、
-		 * 完全なcommandは0x0200ではなく0x0002となる。 */
-		value[0] = IQS9150_SYSTEM_CONTROL_SW_RESET;
-		value[1] = 0;
+		/* Datasheet A.12: SW Reset is bit 9. Serialize 0x0200 little-endian.
+   * Bit 1 belongs to Mode Select, not reset. / bit 9がSW Reset。
+   * 0x0200をlittle-endianで送る。bit 1はMode Selectである。 */
+		value[0] = IQS9150_SYSTEM_CONTROL_SW_RESET & 0xff;
+		value[1] = IQS9150_SYSTEM_CONTROL_SW_RESET >> 8;
 		rc = write_reg(dev, IQS9150_SYSTEM_CONTROL_REG, value, 2);
 		if (rc != 0) {
 			iqs9150_fail(data, "runtime software reset", rc);
@@ -656,22 +688,41 @@ static void iqs9150_work_handler(struct k_work *work)
 			return;
 		}
 		data->state = IQS9150_RECOVER_WAIT_RESET;
-		LOG_INF("runtime recovery: software reset requested");
+  data->reset_requested_ms = k_uptime_get();
+  data->reset_request_attempts++;
+		LOG_INF("runtime recovery: software reset 0x0200 requested (attempt=%u)",
+          data->reset_request_attempts);
 		return;
 
 	case IQS9150_RECOVER_WAIT_RESET:
+  if (k_uptime_get() - data->reset_requested_ms >= IQS9150_RESET_VERIFY_TIMEOUT_MS) {
+   if (data->reset_request_attempts >= IQS9150_RESET_REQUEST_RETRY_MAX) {
+    iqs9150_fail(data, "runtime reset verification timeout", -ETIMEDOUT);
+   } else {
+    data->state = IQS9150_RECOVER_RESET;
+    LOG_WRN("runtime recovery: Show Reset timeout; retrying request %u/%u",
+            data->reset_request_attempts + 1, IQS9150_RESET_REQUEST_RETRY_MAX);
+    k_work_schedule(&data->work, K_MSEC(IQS9150_PRODUCT_RETRY_INTERVAL_MS));
+   }
+   return;
+  }
+  if (gpio_pin_get_dt(&((const struct iqs9150_config *)dev->config)->rdy_gpio) != 1)
+   return;
 		rc = read_reg(dev, IQS9150_INFO_FLAGS_REG, value, 2);
 		if (rc != 0) {
-			iqs9150_fail(data, "runtime reset verification", rc);
+   LOG_WRN("runtime reset verification read failed: %d; retry until deadline", rc);
 			return;
 		}
 		rc = terminate_comms_if_needed(data);
 		if (rc != 0) {
-			iqs9150_fail(data, "runtime reset verification termination", rc);
+   LOG_WRN("runtime reset verification termination failed: %d; retry until deadline", rc);
 			return;
 		}
 		if ((value[0] & IQS9150_INFO_SHOW_RESET) == 0) {
-			LOG_WRN("runtime recovery waiting for Show Reset");
+   if (k_uptime_get() - data->last_reset_wait_log_ms >= 500) {
+    LOG_WRN("runtime recovery waiting for Show Reset; flags=0x%02x%02x", value[1], value[0]);
+    data->last_reset_wait_log_ms = k_uptime_get();
+   }
 			return;
 		}
 		data->state = IQS9150_ACK_RESET;
@@ -683,6 +734,43 @@ static void iqs9150_work_handler(struct k_work *work)
 	}
 }
 
+/* Event-mode silence is normal. Sample GPIO only; never reset or force I2C
+ * merely because no reports arrived. Recover an asserted, stranded RDY.
+ * Event Modeの無通信は正常。GPIOのみ監視し、無通信時間を理由にリセットしない。 */
+static void iqs9150_rdy_watch_handler(struct k_work *work)
+{
+ struct iqs9150_data *data = CONTAINER_OF(k_work_delayable_from_work(work),
+                                        struct iqs9150_data, rdy_watch_work);
+ const struct iqs9150_config *cfg = data->dev->config;
+ int active = gpio_pin_get_dt(&cfg->rdy_gpio);
+ int64_t now = k_uptime_get();
+ bool verification_expired = data->state == IQS9150_RECOVER_WAIT_RESET &&
+       now - data->reset_requested_ms >= IQS9150_RESET_VERIFY_TIMEOUT_MS;
+ if (((data->state != IQS9150_WAIT_PRODUCT && data->state != IQS9150_ERROR &&
+       active == 1) || verification_expired) &&
+     !k_work_delayable_is_pending(&data->work)) {
+  if (verification_expired) {
+   LOG_WRN("runtime reset verification deadline reached; scheduling timeout check");
+  } else {
+   data->rdy_rescues++;
+  if (data->rdy_rescues == 1 || now - data->last_rescue_log_ms >= 5000) {
+   LOG_WRN("RDY active without pending work; scheduling level rescue (state=%u count=%u)",
+           data->state, data->rdy_rescues);
+   data->last_rescue_log_ms = now;
+  }
+  }
+  k_work_schedule(&data->work, K_NO_WAIT);
+ }
+ if (cfg->runtime_diagnostics && now - data->last_watch_log_ms >= 10000) {
+  LOG_INF("runtime health: state=%u rdy-active=%d irq=%u reports=%u age=%lld ms errors=%u rescues=%u",
+          data->state, active, (uint32_t)atomic_get(&data->rdy_irq_count),
+          data->reports_read, data->last_report_ms ? now - data->last_report_ms : -1LL,
+          data->report_error_count, data->rdy_rescues);
+  data->last_watch_log_ms = now;
+ }
+ k_work_reschedule(&data->rdy_watch_work, K_MSEC(cfg->rdy_watch_ms));
+}
+
 static void iqs9150_rdy_callback(const struct device *port, struct gpio_callback *callback,
 				 uint32_t pins)
 {
@@ -690,6 +778,7 @@ static void iqs9150_rdy_callback(const struct device *port, struct gpio_callback
 
 	ARG_UNUSED(port);
 	ARG_UNUSED(pins);
+ atomic_inc(&data->rdy_irq_count);
 	k_work_schedule(&data->work, K_NO_WAIT);
 }
 
@@ -713,6 +802,7 @@ static int iqs9150_init(const struct device *dev)
 	data->dev = dev;
 	data->state = IQS9150_WAIT_PRODUCT;
 	k_work_init_delayable(&data->work, iqs9150_work_handler);
+ k_work_init_delayable(&data->rdy_watch_work, iqs9150_rdy_watch_handler);
 	gpio_init_callback(&data->rdy_callback, iqs9150_rdy_callback, BIT(cfg->rdy_gpio.pin));
 	rc = gpio_add_callback(cfg->rdy_gpio.port, &data->rdy_callback);
 	if (rc != 0) {
@@ -732,16 +822,23 @@ static int iqs9150_init(const struct device *dev)
 	 * 1回の0xeeee読出しでデバイス初期化を失敗させず、非同期で有効な製品番号を待つ。 */
 	LOG_INF("IQS9150 startup probe scheduled at I2C 0x%02x", cfg->i2c.addr);
 	k_work_schedule(&data->work, K_MSEC(IQS9150_PRODUCT_RETRY_INTERVAL_MS));
+ if (cfg->rdy_watch_ms) {
+  k_work_schedule(&data->rdy_watch_work, K_MSEC(cfg->rdy_watch_ms));
+ }
 	return 0;
 }
 
 #define IQS9150_DEFINE(inst) \
+ BUILD_ASSERT(DT_INST_PROP(inst, rdy_watch_ms) >= 0 && \
+              DT_INST_PROP(inst, rdy_watch_ms) <= UINT16_MAX, "rdy-watch-ms out of range"); \
 	static struct iqs9150_data iqs9150_data_##inst; \
 	static const struct iqs9150_config iqs9150_config_##inst = { \
 		.i2c = I2C_DT_SPEC_INST_GET(inst), \
 		.rdy_gpio = GPIO_DT_SPEC_INST_GET(inst, rdy_gpios), \
 		.two_finger_diagnostics = DT_INST_PROP_OR(inst, two_finger_diagnostics, false), \
 		.multitouch_diagnostics = DT_INST_PROP_OR(inst, multitouch_diagnostics, false), \
+  .rdy_watch_ms = DT_INST_PROP_OR(inst, rdy_watch_ms, 250), \
+  .runtime_diagnostics = DT_INST_PROP(inst, runtime_diagnostics), \
 	}; \
 	DEVICE_DT_INST_DEFINE(inst, iqs9150_init, NULL, \
 			      &iqs9150_data_##inst, &iqs9150_config_##inst, \

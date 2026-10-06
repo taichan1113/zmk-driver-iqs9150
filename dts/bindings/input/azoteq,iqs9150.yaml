@@ -5,11 +5,18 @@ compatible: "azoteq,iqs9150"
 include: i2c-device.yaml
 
 properties:
+  rdy-watch-ms:
+    type: int
+    default: 250
+    description: GPIO-only runtime RDY level check interval; zero disables. Inactive event-mode silence does not force I2C or reset.
+  runtime-diagnostics:
+    type: boolean
+    description: Emit a runtime health line every ten seconds with RDY, IRQ, report, error and rescue counters.
   rdy-gpios:
     type: phandle-array
     required: true
     description: |
-      GPIO connected to the IQS9150 RDY output. RDY is active-low and
+      GPIO connected to the IQS9150 RDY output. Specify GPIO_ACTIVE_LOW. RDY is active-low and
       open-drain. Put pull-up flags here only when the EV02 board does not
       provide the required external pull-up.
   two-finger-diagnostics:
