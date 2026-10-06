@@ -45,6 +45,7 @@ LOG_MODULE_REGISTER(iqs9150_ev02_driver, CONFIG_IQS9150_EV02_DRIVER_LOG_LEVEL);
 #define IQS9150_SYSTEM_CONTROL_SW_RESET    BIT(9)
 #define IQS9150_RESET_VERIFY_TIMEOUT_MS    2000
 #define IQS9150_RESET_REQUEST_RETRY_MAX    3
+#define IQS9150_COMMS_REQUEST_RETRY_MAX    120
 
 #define IQS9150_INFO_TP_ATI_ERROR          BIT(3)
 #define IQS9150_INFO_TP_REATI_OCCURRED     BIT(4)
@@ -115,6 +116,7 @@ struct iqs9150_data {
 	uint8_t ack_attempts;
 	uint8_t report_error_count;
 	uint8_t product_attempts;
+	uint8_t comms_request_attempts;
 	uint8_t ati_recovery_attempts;
  uint8_t reset_request_attempts;
  int64_t reset_requested_ms;
@@ -277,6 +279,7 @@ static void iqs9150_start_runtime_recovery(struct iqs9150_data *data, const char
 	data->ack_attempts = 0;
 	data->report_error_count = 0;
  data->reset_request_attempts = 0;
+	data->comms_request_attempts = 0;
 	data->block_index = 0;
 	data->block_offset = 0;
 	data->state = sensor_already_reset ? IQS9150_ACK_RESET : IQS9150_RECOVER_RESET;
@@ -415,6 +418,31 @@ static void iqs9150_fail(struct iqs9150_data *data, const char *operation, int r
 	LOG_ERR("STEP1B %s failed: %d", operation, rc);
 }
 
+/* Datasheet 12.9.2: the GUI image selects the alternative Force Comms
+ * Method. A warm MCU restart must request a window (0xFF), not interpret
+ * the out-of-window 0xEEEE response as product information. Only startup
+ * and explicitly requested recovery use this helper; normal idle stays quiet.
+ * MCUだけの再起動時は0xFFで通信窓を要求し、RDY有効になってから読む。 */
+static void iqs9150_request_window(struct iqs9150_data *data)
+{
+	const struct iqs9150_config *cfg = data->dev->config;
+	const uint8_t request = 0xff;
+	int rc;
+
+	if (data->comms_request_attempts >= IQS9150_COMMS_REQUEST_RETRY_MAX) {
+		iqs9150_fail(data, "communication window request timeout", -ETIMEDOUT);
+		return;
+	}
+	rc = i2c_write_dt(&cfg->i2c, &request, sizeof(request));
+	data->comms_request_attempts++;
+	if (data->comms_request_attempts == 1 || data->comms_request_attempts % 20 == 0) {
+		LOG_INF("requesting RDY window: state=%u attempt=%u/%u rc=%d",
+			data->state, data->comms_request_attempts,
+			IQS9150_COMMS_REQUEST_RETRY_MAX, rc);
+	}
+	k_work_schedule(&data->work, K_MSEC(IQS9150_PRODUCT_RETRY_INTERVAL_MS));
+}
+
 static void iqs9150_work_handler(struct k_work *work)
 {
 	struct k_work_delayable *delayable = k_work_delayable_from_work(work);
@@ -422,10 +450,21 @@ static void iqs9150_work_handler(struct k_work *work)
 	const struct device *dev = data->dev;
 	uint8_t value[4] = {0};
 	int rc;
+	int active = gpio_pin_get_dt(&((const struct iqs9150_config *)dev->config)->rdy_gpio);
+
+	if ((data->state == IQS9150_WAIT_PRODUCT || data->state == IQS9150_READ_COMMS_CONFIG) &&
+	    active != 1) {
+		if (active < 0) {
+			iqs9150_fail(data, "startup RDY read", active);
+		} else {
+			iqs9150_request_window(data);
+		}
+		return;
+	}
 
  /* Do not force register transactions between communication windows.
-  * WAIT_PRODUCT retains the startup probe; reset timeout is handled below.
-  * RDY窓外にレジスタ通信を強制しない。製品probeとreset timeoutは別扱い。 */
+  * Startup requests a window separately; reset timeout is handled below.
+  * RDY窓外にレジスタ通信を強制しない。起動時の窓要求とreset timeoutは別扱い。 */
  if (data->state != IQS9150_WAIT_PRODUCT && data->state != IQS9150_ERROR &&
      data->state != IQS9150_RECOVER_RESET && data->state != IQS9150_RECOVER_WAIT_RESET &&
      gpio_pin_get_dt(&((const struct iqs9150_config *)dev->config)->rdy_gpio) != 1)
@@ -445,10 +484,7 @@ static void iqs9150_work_handler(struct k_work *work)
 			/* The Config Settings read and following System Control write must
 			 * occur in an RDY window. / Config Settings読出しと次のSystem
 			 * Control書込みはRDYウィンドウ内で実行する。 */
-			if (gpio_pin_get_dt(&((const struct iqs9150_config *)dev->config)->rdy_gpio) ==
-			    1) {
-				k_work_schedule(&data->work, K_NO_WAIT);
-			}
+			k_work_schedule(&data->work, K_NO_WAIT);
 			return;
 		}
 
@@ -476,9 +512,15 @@ static void iqs9150_work_handler(struct k_work *work)
 			iqs9150_fail(data, "Config Settings communication termination", rc);
 			return;
 		}
-		data->state = IQS9150_ACK_RESET;
+		/* The MCU may have reset while the sensor kept its Event Mode image.
+		 * Reset the sensor deliberately before ACK/configuration so both cold
+		 * and warm starts follow the same initialization sequence. */
+		data->comms_request_attempts = 0;
+		data->reset_request_attempts = 0;
+		data->state = IQS9150_RECOVER_RESET;
 		LOG_INF("IQS9150 communication termination=%s", data->terminate_comms_window ?
 			"0xEEEE" : "STOP");
+		k_work_schedule(&data->work, K_NO_WAIT);
 		return;
 
 	case IQS9150_ACK_RESET:
@@ -666,7 +708,7 @@ static void iqs9150_work_handler(struct k_work *work)
 		 * active-low RDY windowを待ち、recovery transactionも起動時と同じprotocol
 		 * timingに従わせる。 */
 		if (gpio_pin_get_dt(&((const struct iqs9150_config *)dev->config)->rdy_gpio) != 1) {
-			k_work_schedule(&data->work, K_MSEC(IQS9150_PRODUCT_RETRY_INTERVAL_MS));
+			iqs9150_request_window(data);
 			return;
 		}
 		/* Reset only after a failed report sequence. A sensor-originated reset
@@ -688,6 +730,7 @@ static void iqs9150_work_handler(struct k_work *work)
 			return;
 		}
 		data->state = IQS9150_RECOVER_WAIT_RESET;
+		data->comms_request_attempts = 0;
   data->reset_requested_ms = k_uptime_get();
   data->reset_request_attempts++;
 		LOG_INF("runtime recovery: software reset 0x0200 requested (attempt=%u)",

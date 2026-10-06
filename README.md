@@ -117,6 +117,11 @@ does not force I2C or reset the sensor simply because event mode is quiet.
 IRQ/report progress and recovery. Normal reset verification has a two-second
 deadline and at most three software-reset requests.
 
+On an MCU-only restart, the sensor may retain Event Mode and its alternate
+Force Comms setting. Startup requests a communication window with `0xFF`, waits
+for RDY, reads product/configuration data, and explicitly resets the sensor before
+reinitialization. Window requests are bounded and are not sent during normal idle.
+
 The driver writes the bundled EV02 settings at initialization. Keep the pad
 untouched until initialization and ATI calibration complete. If calibration
 repeatedly fails, remove all fingers and check power, RDY, and I2C wiring.
@@ -239,6 +244,10 @@ runtime復旧コマンドは、[IQS9150/IQS9151データシート](https://www.a
 System Controlのbit 9（`0x0200`）を使います。通信終了フラグはConfig Settingsの
 下位byteのbit 6で、付属の`0x461E`設定ではSTOPで通信窓が終了します。
 runtimeのレジスタ通信と復旧処理は、論理的に有効なRDYを待って実行します。
+
+MCUだけの再起動では、センサーのEvent Modeと代替Force Comms設定が残る場合があります。
+起動時は `0xFF` で通信窓を要求し、RDYを待って製品番号・設定を読み、
+センサーを明示的にリセットして再初期化します。窓要求は回数を制限し、通常の無操作時には送りません。
 
 `rdy-watch-ms`はGPIOだけを監視する間隔で、既定250 ms、0で無効です。
 RDY有効のまま処理が予約されていない場合にworkを起こしますが、Event Modeで
