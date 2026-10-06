@@ -5,6 +5,14 @@ compatible: "azoteq,iqs9150"
 include: i2c-device.yaml
 
 properties:
+  diagnostic-disable-mode-timeouts:
+    type: boolean
+    description: |
+      Diagnostic only: set five automatic mode timeouts (0x11AC through 0x11B5)
+      to zero and verify readback before ATI. Sampling periods, Event Mode and
+      automatic reference management are unchanged. Battery consumption increases.
+      診断専用：5つの自動mode timeoutを0にし、ATI前にreadback確認する。
+      sampling・Event Mode・自動reference管理は維持。電池消費は増える。
   rdy-watch-ms:
     type: int
     default: 250

@@ -32,6 +32,8 @@ LOG_MODULE_REGISTER(iqs9150_ev02_driver, CONFIG_IQS9150_EV02_DRIVER_LOG_LEVEL);
 #define IQS9150_INFO_FLAGS_REG            0x1020
 #define IQS9150_SYSTEM_CONTROL_REG        0x11BC
 #define IQS9150_CONFIG_SETTINGS_REG       0x11BE
+#define IQS9150_MODE_TIMEOUT_FIRST_REG    0x11AC
+#define IQS9150_MODE_TIMEOUT_BYTES        10
 #define IQS9150_TERMINATE_COMMS_REG        0xEEEE
 
 #define IQS9150_PRODUCT_NUMBER            0x076A
@@ -90,6 +92,7 @@ enum iqs9150_state {
 	IQS9150_RECOVER_RESET,
 	IQS9150_RECOVER_WAIT_RESET,
 	IQS9150_ERROR,
+	IQS9150_VERIFY_MODE_TIMEOUTS,
 };
 
 struct iqs9150_config {
@@ -97,6 +100,7 @@ struct iqs9150_config {
 	struct gpio_dt_spec rdy_gpio;
 	bool two_finger_diagnostics;
 	bool multitouch_diagnostics;
+	bool diagnostic_disable_mode_timeouts;
  uint16_t rdy_watch_ms;
  bool runtime_diagnostics;
 };
@@ -455,6 +459,23 @@ static void iqs9150_fail(struct iqs9150_data *data, const char *operation, int r
 	LOG_ERR("STEP1B %s failed: %d", operation, rc);
 }
 
+/* Datasheet 6.2: timeout zero means never. Patch only the five timeout words;
+ * retain sampling periods, automatic reference management and Event Mode.
+ * timeout=0は遷移なし。sampling・自動reference管理・Event Modeは維持する。 */
+static void iqs9150_init_payload(const struct iqs9150_config *cfg, uint16_t reg,
+				const uint8_t *source, uint8_t *payload, size_t len)
+{
+	memcpy(payload, source, len);
+	if (!cfg->diagnostic_disable_mode_timeouts) return;
+	for (size_t i = 0; i < len; i++) {
+		uint32_t address = (uint32_t)reg + i;
+		if (address >= IQS9150_MODE_TIMEOUT_FIRST_REG &&
+		    address < IQS9150_MODE_TIMEOUT_FIRST_REG + IQS9150_MODE_TIMEOUT_BYTES) {
+			payload[i] = 0;
+		}
+	}
+}
+
 /* Datasheet 12.9.2: the GUI image selects the alternative Force Comms
  * Method. A warm MCU restart must request a window (0xFF), not interpret
  * the out-of-window 0xEEEE response as product information. Only startup
@@ -485,11 +506,13 @@ static void iqs9150_work_handler(struct k_work *work)
 	struct k_work_delayable *delayable = k_work_delayable_from_work(work);
 	struct iqs9150_data *data = CONTAINER_OF(delayable, struct iqs9150_data, work);
 	const struct device *dev = data->dev;
+	const struct iqs9150_config *cfg = dev->config;
 	uint8_t value[4] = {0};
 	int rc;
 	int active = gpio_pin_get_dt(&((const struct iqs9150_config *)dev->config)->rdy_gpio);
 
-	if ((data->state == IQS9150_WAIT_PRODUCT || data->state == IQS9150_READ_COMMS_CONFIG) &&
+	if ((data->state == IQS9150_WAIT_PRODUCT || data->state == IQS9150_READ_COMMS_CONFIG ||
+	     data->state == IQS9150_VERIFY_MODE_TIMEOUTS) &&
 	    active != 1) {
 		if (active < 0) {
 			iqs9150_fail(data, "startup RDY read", active);
@@ -611,17 +634,26 @@ static void iqs9150_work_handler(struct k_work *work)
 	case IQS9150_WRITE_CONFIG: {
 		const struct iqs9150_block *block;
 		size_t chunk;
+		uint8_t payload[IQS9150_WRITE_PAYLOAD_MAX];
 
 		if (data->block_index == ARRAY_SIZE(ev02_blocks)) {
-			data->state = IQS9150_START_ATI;
-			LOG_INF("STEP1B initialization data written; starting ATI");
+			data->state = cfg->diagnostic_disable_mode_timeouts ?
+				IQS9150_VERIFY_MODE_TIMEOUTS : IQS9150_START_ATI;
+			data->comms_request_attempts = 0;
+			if (cfg->diagnostic_disable_mode_timeouts) {
+				LOG_INF("STEP1B initialization data written; verifying diagnostic mode timeouts");
+			} else {
+				LOG_INF("STEP1B initialization data written; starting ATI");
+			}
 			return;
 		}
 
 		block = &ev02_blocks[data->block_index];
 		chunk = MIN(IQS9150_WRITE_PAYLOAD_MAX, block->len - data->block_offset);
+		iqs9150_init_payload(cfg, block->reg + data->block_offset,
+			block->data + data->block_offset, payload, chunk);
 		rc = write_reg(dev, block->reg + data->block_offset,
-			       block->data + data->block_offset, chunk);
+			       payload, chunk);
 		if (rc != 0) {
 			iqs9150_fail(data, "initialization data write", rc);
 			return;
@@ -642,6 +674,29 @@ static void iqs9150_work_handler(struct k_work *work)
 			data->block_index++;
 			data->block_offset = 0;
 		}
+		return;
+	}
+
+	case IQS9150_VERIFY_MODE_TIMEOUTS: {
+		uint8_t timeouts[IQS9150_MODE_TIMEOUT_BYTES];
+		rc = read_reg(dev, IQS9150_MODE_TIMEOUT_FIRST_REG, timeouts, sizeof(timeouts));
+		if (rc != 0) {
+			iqs9150_fail(data, "diagnostic mode timeout readback", rc);
+			return;
+		}
+		rc = terminate_comms_if_needed(data);
+		if (rc != 0) {
+			iqs9150_fail(data, "diagnostic timeout communication termination", rc);
+			return;
+		}
+		for (size_t i = 0; i < sizeof(timeouts); i++) {
+			if (timeouts[i] != 0) {
+				iqs9150_fail(data, "diagnostic mode timeout verification", -EIO);
+				return;
+			}
+		}
+		LOG_INF("diagnostic active-only: five mode timeouts verified zero; automatic reference management retained");
+		data->state = IQS9150_START_ATI;
 		return;
 	}
 
@@ -917,6 +972,7 @@ static int iqs9150_init(const struct device *dev)
 		.rdy_gpio = GPIO_DT_SPEC_INST_GET(inst, rdy_gpios), \
 		.two_finger_diagnostics = DT_INST_PROP_OR(inst, two_finger_diagnostics, false), \
 		.multitouch_diagnostics = DT_INST_PROP_OR(inst, multitouch_diagnostics, false), \
+		.diagnostic_disable_mode_timeouts = DT_INST_PROP_OR(inst, diagnostic_disable_mode_timeouts, false), \
   .rdy_watch_ms = DT_INST_PROP_OR(inst, rdy_watch_ms, 250), \
   .runtime_diagnostics = DT_INST_PROP(inst, runtime_diagnostics), \
 	}; \
