@@ -89,6 +89,24 @@ See the Devicetree binding at `dts/bindings/input/azoteq,iqs9150.yaml` for the
 complete sensor-node interface. Pointer speed, tap behavior, and gesture
 recognition belong to the application that consumes contact frames.
 
+### Automatic power-mode limit
+
+Set `power-mode-limit` on the sensor node at build time:
+
+| Value | Policy |
+| --- | --- |
+| `"none"` (default) | Preserve the bundled automatic mode timeouts |
+| `"active"` | Disable all five mode timeouts; keep Active |
+| `"idle"` | Allow Active/Idle-Touch/Idle; block Idle-to-LP1 |
+| `"lp1"` | Allow LP1; block LP1-to-LP2 |
+
+For example: `power-mode-limit = "idle";`. Modified timeout words are read back
+before ATI. Sampling periods and automatic reference management are retained.
+This selects sensor-internal automatic modes, not Zephyr device PM. It is not a
+runtime switch. Restricting modes can increase battery consumption; measure on
+your hardware. Legacy diagnostic timeout flags take precedence; do not combine
+them with this setting. Selection does not prove the sensor's current mode.
+
 ### Contact interface
 
 The driver emits Zephyr input events, not host-facing multi-touch HID reports.
@@ -224,6 +242,23 @@ CONFIG_INPUT_QUEUE_MAX_MSGS=64
 
 センサーnodeの全設定は `dts/bindings/input/azoteq,iqs9150.yaml` を参照してください。
 ポインタ速度、タップ動作、ジェスチャー認識は、接触フレームを使うアプリケーション側の機能です。
+
+### 自動省電力段階の上限
+
+センサーノードの `power-mode-limit` でビルド時に設定します。
+
+| 値 | 方針 |
+| --- | --- |
+| `"none"`（既定） | 同梱初期化データの自動mode timeoutを維持 |
+| `"active"` | 5つのmode timeoutを無効化してActive維持 |
+| `"idle"` | Active/Idle-Touch/Idleを許可し、Idle→LP1を停止 |
+| `"lp1"` | LP1を許可し、LP1→LP2を停止 |
+
+例：`power-mode-limit = "idle";`。変更したtimeoutはATI前に読み戻し確認します。
+sampling周期と自動reference管理は維持。Zephyr PMではなくセンサー内部の自動modeを
+選ぶ起動時設定で、runtime切替ではありません。省電力段階の制限で電池消費は増え得るため、
+実機で測定してください。旧診断timeout設定が優先するので併用しないでください。
+この設定だけではセンサーの現在modeを確認したことにはなりません。
 
 ### 接触インターフェース
 

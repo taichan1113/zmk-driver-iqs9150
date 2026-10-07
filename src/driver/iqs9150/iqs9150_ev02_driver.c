@@ -35,6 +35,11 @@ LOG_MODULE_REGISTER(iqs9150_ev02_driver, CONFIG_IQS9150_EV02_DRIVER_LOG_LEVEL);
 #define IQS9150_MODE_TIMEOUT_FIRST_REG    0x11AC
 #define IQS9150_MODE_TIMEOUT_BYTES        10
 #define IQS9150_IDLE_TIMEOUT_REG          0x11B0
+#define IQS9150_LP1_TIMEOUT_REG           0x11B2
+#define IQS9150_POWER_LIMIT_NONE          0
+#define IQS9150_POWER_LIMIT_ACTIVE        1
+#define IQS9150_POWER_LIMIT_IDLE          2
+#define IQS9150_POWER_LIMIT_LP1           3
 #define IQS9150_TERMINATE_COMMS_REG        0xEEEE
 
 #define IQS9150_PRODUCT_NUMBER            0x076A
@@ -103,6 +108,7 @@ struct iqs9150_config {
 	bool multitouch_diagnostics;
 	bool diagnostic_disable_mode_timeouts;
 	bool diagnostic_disable_lp_entry;
+	uint8_t power_mode_limit;
  uint16_t rdy_watch_ms;
  bool runtime_diagnostics;
 };
@@ -464,18 +470,34 @@ static void iqs9150_fail(struct iqs9150_data *data, const char *operation, int r
 /* Datasheet 6.2: timeout zero means never. Patch only the five timeout words;
  * retain sampling periods, automatic reference management and Event Mode.
  * timeout=0は遷移なし。sampling・自動reference管理・Event Modeは維持する。 */
+static uint8_t iqs9150_power_limit(const struct iqs9150_config *cfg)
+{
+	if (cfg->diagnostic_disable_mode_timeouts) return IQS9150_POWER_LIMIT_ACTIVE;
+	if (cfg->diagnostic_disable_lp_entry) return IQS9150_POWER_LIMIT_IDLE;
+	return cfg->power_mode_limit;
+}
+
+static uint16_t iqs9150_timeout_patch_reg(const struct iqs9150_config *cfg)
+{
+	switch (iqs9150_power_limit(cfg)) {
+	case IQS9150_POWER_LIMIT_ACTIVE: return IQS9150_MODE_TIMEOUT_FIRST_REG;
+	case IQS9150_POWER_LIMIT_IDLE: return IQS9150_IDLE_TIMEOUT_REG;
+	case IQS9150_POWER_LIMIT_LP1: return IQS9150_LP1_TIMEOUT_REG;
+	default: return 0;
+	}
+}
+
 static void iqs9150_init_payload(const struct iqs9150_config *cfg, uint16_t reg,
 				const uint8_t *source, uint8_t *payload, size_t len)
 {
 	memcpy(payload, source, len);
-	if (!cfg->diagnostic_disable_mode_timeouts && !cfg->diagnostic_disable_lp_entry) return;
+	uint16_t first = iqs9150_timeout_patch_reg(cfg);
+	if (first == 0) return;
+	size_t bytes = iqs9150_power_limit(cfg) == IQS9150_POWER_LIMIT_ACTIVE ?
+		IQS9150_MODE_TIMEOUT_BYTES : 2;
 	for (size_t i = 0; i < len; i++) {
 		uint32_t address = (uint32_t)reg + i;
-		if ((cfg->diagnostic_disable_mode_timeouts &&
-		     address >= IQS9150_MODE_TIMEOUT_FIRST_REG &&
-		     address < IQS9150_MODE_TIMEOUT_FIRST_REG + IQS9150_MODE_TIMEOUT_BYTES) ||
-		    (cfg->diagnostic_disable_lp_entry &&
-		     address >= IQS9150_IDLE_TIMEOUT_REG && address < IQS9150_IDLE_TIMEOUT_REG + 2)) {
+		if (address >= first && address < first + bytes) {
 			payload[i] = 0;
 		}
 	}
@@ -642,10 +664,10 @@ static void iqs9150_work_handler(struct k_work *work)
 		uint8_t payload[IQS9150_WRITE_PAYLOAD_MAX];
 
 		if (data->block_index == ARRAY_SIZE(ev02_blocks)) {
-			data->state = (cfg->diagnostic_disable_mode_timeouts || cfg->diagnostic_disable_lp_entry) ?
+			data->state = iqs9150_timeout_patch_reg(cfg) != 0 ?
 				IQS9150_VERIFY_MODE_TIMEOUTS : IQS9150_START_ATI;
 			data->comms_request_attempts = 0;
-			if (cfg->diagnostic_disable_mode_timeouts || cfg->diagnostic_disable_lp_entry) {
+			if (iqs9150_timeout_patch_reg(cfg) != 0) {
 				LOG_INF("STEP1B initialization data written; verifying diagnostic mode timeouts");
 			} else {
 				LOG_INF("STEP1B initialization data written; starting ATI");
@@ -684,9 +706,8 @@ static void iqs9150_work_handler(struct k_work *work)
 
 	case IQS9150_VERIFY_MODE_TIMEOUTS: {
 		uint8_t timeouts[IQS9150_MODE_TIMEOUT_BYTES];
-		uint16_t reg = cfg->diagnostic_disable_mode_timeouts ?
-			IQS9150_MODE_TIMEOUT_FIRST_REG : IQS9150_IDLE_TIMEOUT_REG;
-		size_t len = cfg->diagnostic_disable_mode_timeouts ? sizeof(timeouts) : 2;
+		uint16_t reg = iqs9150_timeout_patch_reg(cfg);
+		size_t len = iqs9150_power_limit(cfg) == IQS9150_POWER_LIMIT_ACTIVE ? sizeof(timeouts) : 2;
 		rc = read_reg(dev, reg, timeouts, len);
 		if (rc != 0) {
 			iqs9150_fail(data, "diagnostic mode timeout readback", rc);
@@ -703,10 +724,12 @@ static void iqs9150_work_handler(struct k_work *work)
 				return;
 			}
 		}
-		if (cfg->diagnostic_disable_mode_timeouts) {
+		if (iqs9150_power_limit(cfg) == IQS9150_POWER_LIMIT_ACTIVE) {
 			LOG_INF("diagnostic active-only: five mode timeouts verified zero; automatic reference management retained");
-		} else {
+		} else if (iqs9150_power_limit(cfg) == IQS9150_POWER_LIMIT_IDLE) {
 			LOG_INF("diagnostic idle-only: Idle-to-LP1 timeout verified zero; Active/Idle transitions retained");
+		} else {
+			LOG_INF("power limit lp1: LP1-to-LP2 timeout verified zero; Active/Idle/LP1 transitions retained");
 		}
 		data->state = IQS9150_START_ATI;
 		return;
@@ -986,6 +1009,7 @@ static int iqs9150_init(const struct device *dev)
 		.multitouch_diagnostics = DT_INST_PROP_OR(inst, multitouch_diagnostics, false), \
 		.diagnostic_disable_mode_timeouts = DT_INST_PROP_OR(inst, diagnostic_disable_mode_timeouts, false), \
 		.diagnostic_disable_lp_entry = DT_INST_PROP_OR(inst, diagnostic_disable_lp_entry, false), \
+		.power_mode_limit = DT_INST_ENUM_IDX(inst, power_mode_limit), \
   .rdy_watch_ms = DT_INST_PROP_OR(inst, rdy_watch_ms, 250), \
   .runtime_diagnostics = DT_INST_PROP(inst, runtime_diagnostics), \
 	}; \

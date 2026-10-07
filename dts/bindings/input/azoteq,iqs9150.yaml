@@ -5,6 +5,19 @@ compatible: "azoteq,iqs9150"
 include: i2c-device.yaml
 
 properties:
+  power-mode-limit:
+    type: string
+    default: "none"
+    enum: ["none", "active", "idle", "lp1"]
+    description: |
+      Deepest allowed automatic power mode. none preserves initialization data;
+      active zeros all five mode timeouts; idle blocks Idle-to-LP1; lp1 blocks
+      LP1-to-LP2. Modified timeouts are verified before ATI. Automatic reference
+      management and sampling periods remain unchanged. This is a startup-only
+      policy, not Zephyr suspend/resume. Legacy diagnostic flags take precedence.
+      自動省電力段階の上限。noneは初期値維持、activeは全mode timeoutを0、
+      idleはLP1移行停止、lp1はLP2移行停止。ATI前に変更箇所をreadback確認。
+      起動時の設定で、sampling・自動reference管理は維持。旧診断設定が優先。
   diagnostic-disable-lp-entry:
     type: boolean
     description: |
