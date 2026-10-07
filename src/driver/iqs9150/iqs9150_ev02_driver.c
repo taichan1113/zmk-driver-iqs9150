@@ -37,6 +37,8 @@ LOG_MODULE_REGISTER(iqs9150_ev02_driver, CONFIG_IQS9150_EV02_DRIVER_LOG_LEVEL);
 #define IQS9150_MODE_TIMEOUT_BYTES        10
 #define IQS9150_IDLE_TIMEOUT_REG          0x11B0
 #define IQS9150_LP1_TIMEOUT_REG           0x11B2
+#define IQS9150_OTHER_SETTINGS_REG        0x11C0
+#define IQS9150_LP2_AUTOPROX_ENABLE       BIT(5)
 #define IQS9150_POWER_LIMIT_NONE          0
 #define IQS9150_POWER_LIMIT_ACTIVE        1
 #define IQS9150_POWER_LIMIT_IDLE          2
@@ -112,6 +114,7 @@ struct iqs9150_config {
 	bool diagnostic_disable_lp_entry;
 	uint8_t power_mode_limit;
 	bool power_diagnostics;
+	bool diagnostic_disable_lp2_autoprox;
  uint16_t rdy_watch_ms;
  bool runtime_diagnostics;
 };
@@ -521,13 +524,15 @@ static void iqs9150_init_payload(const struct iqs9150_config *cfg, uint16_t reg,
 {
 	memcpy(payload, source, len);
 	uint16_t first = iqs9150_timeout_patch_reg(cfg);
-	if (first == 0) return;
 	size_t bytes = iqs9150_power_limit(cfg) == IQS9150_POWER_LIMIT_ACTIVE ?
 		IQS9150_MODE_TIMEOUT_BYTES : 2;
 	for (size_t i = 0; i < len; i++) {
 		uint32_t address = (uint32_t)reg + i;
-		if (address >= first && address < first + bytes) {
+		if (first != 0 && address >= first && address < first + bytes) {
 			payload[i] = 0;
+		}
+		if (cfg->diagnostic_disable_lp2_autoprox && address == IQS9150_OTHER_SETTINGS_REG) {
+			payload[i] &= ~IQS9150_LP2_AUTOPROX_ENABLE;
 		}
 	}
 }
@@ -696,7 +701,8 @@ static void iqs9150_work_handler(struct k_work *work)
 		if (data->block_index == ARRAY_SIZE(ev02_blocks)) {
 			data->state = iqs9150_timeout_patch_reg(cfg) != 0 ?
 				IQS9150_VERIFY_MODE_TIMEOUTS :
-				cfg->power_diagnostics ? IQS9150_READ_POWER_SETUP : IQS9150_START_ATI;
+				(cfg->power_diagnostics || cfg->diagnostic_disable_lp2_autoprox) ?
+				IQS9150_READ_POWER_SETUP : IQS9150_START_ATI;
 			data->power_setup_phase = 0;
 			data->comms_request_attempts = 0;
 			if (iqs9150_timeout_patch_reg(cfg) != 0) {
@@ -763,7 +769,8 @@ static void iqs9150_work_handler(struct k_work *work)
 		} else {
 			LOG_INF("power limit lp1: LP1-to-LP2 timeout verified zero; Active/Idle/LP1 transitions retained");
 		}
-		data->state = cfg->power_diagnostics ? IQS9150_READ_POWER_SETUP : IQS9150_START_ATI;
+		data->state = (cfg->power_diagnostics || cfg->diagnostic_disable_lp2_autoprox) ?
+			IQS9150_READ_POWER_SETUP : IQS9150_START_ATI;
 		return;
 	}
 
@@ -783,12 +790,21 @@ static void iqs9150_work_handler(struct k_work *work)
 				le16(setup+10), le16(setup+12), le16(setup+14), le16(setup+16), le16(setup+18), setup[21]);
 			data->power_setup_phase = 1;
 		} else {
+			if (cfg->diagnostic_disable_lp2_autoprox) {
+				uint16_t expected = (OTHER_SETTINGS_0 & ~IQS9150_LP2_AUTOPROX_ENABLE) |
+					((uint16_t)OTHER_SETTINGS_1 << 8);
+				if (le16(setup+2) != expected) {
+					iqs9150_fail(data, "LP2 Auto-Prox off verification", -EIO);
+					return;
+				}
+				LOG_INF("diagnostic LP2 Auto-Prox disabled: Other Settings verified 0x%04x", expected);
+			}
 			LOG_INF("power setup: config=0x%04x other=0x%04x alp=0x%02x%02x%02x%02x alp-enabled=%u lp1-autoprox=%u lp2-autoprox=%u threshold=%u/%u debounce=%u/%u filter=%u/%u/%u/%u",
 				le16(setup), le16(setup+2), setup[7], setup[6], setup[5], setup[4],
 				!!(setup[7]&BIT(7)), !!(setup[2]&BIT(4)), !!(setup[2]&BIT(5)),
 				setup[16], setup[17], setup[18], setup[19], setup[22], setup[23], setup[24], setup[25]);
-			LOG_INF("power setup: alp-tx=%02x/%02x/%02x/%02x/%02x/%02x; passive mode observation enabled",
-				setup[8],setup[9],setup[10],setup[11],setup[12],setup[13]);
+			LOG_INF("power setup: alp-tx=%02x/%02x/%02x/%02x/%02x/%02x; passive-observation=%u",
+				setup[8],setup[9],setup[10],setup[11],setup[12],setup[13], cfg->power_diagnostics);
 			data->state = IQS9150_START_ATI;
 		}
 		return;
@@ -1070,6 +1086,7 @@ static int iqs9150_init(const struct device *dev)
 		.diagnostic_disable_lp_entry = DT_INST_PROP_OR(inst, diagnostic_disable_lp_entry, false), \
 		.power_mode_limit = DT_INST_ENUM_IDX(inst, power_mode_limit), \
 		.power_diagnostics = DT_INST_PROP(inst, power_diagnostics), \
+		.diagnostic_disable_lp2_autoprox = DT_INST_PROP(inst, diagnostic_disable_lp2_autoprox), \
   .rdy_watch_ms = DT_INST_PROP_OR(inst, rdy_watch_ms, 250), \
   .runtime_diagnostics = DT_INST_PROP(inst, runtime_diagnostics), \
 	}; \

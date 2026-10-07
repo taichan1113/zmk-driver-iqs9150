@@ -5,6 +5,16 @@ compatible: "azoteq,iqs9150"
 include: i2c-device.yaml
 
 properties:
+  diagnostic-disable-lp2-autoprox:
+    type: boolean
+    description: |
+      Diagnostic only: clear Other Settings bit 5 at 0x11C0; verify the full
+      Other Settings word before ATI. Does not restrict LP2 entry or alter
+      ALP enable/electrodes/thresholds/filters. Default absent preserves original
+      Auto-Prox configuration. Startup readback is mandatory even without
+      power-diagnostics; runtime observation remains optional.
+      診断専用：0x11C0 bit5だけ0にし、ATI前にOther Settings全wordを確認。
+      LP2移行・ALP有効・電極・閾値・filterは変更しない。通常は未指定。
   power-diagnostics:
     type: boolean
     description: |

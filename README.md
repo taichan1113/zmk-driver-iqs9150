@@ -129,6 +129,11 @@ without I2C or wake requests. With Event Mode silence the observation can be
 stale; it is not a live query or a measure of time spent in a mode. Diagnostic
 observation is disabled by default and does not tune ALP settings.
 
+For isolated troubleshooting, `diagnostic-disable-lp2-autoprox` clears only the
+LP2 Auto-Prox enable bit and verifies the complete Other Settings word before
+ATI. It leaves LP2 entry and all other ALP settings unchanged. It is absent by
+default and is not a general-purpose sleep-disable switch.
+
 The runtime recovery command uses System Control bit 9 (`0x0200`), as specified
 in the [IQS9150/IQS9151 datasheet](https://www.azoteq.com/images/stories/pdf/IQS9150_IQS9151_datasheet.pdf).
 The communication-termination flag is Configuration Settings bit 6 in the low
@@ -286,6 +291,10 @@ driverはZephyr input eventを出力し、ホスト向けマルチタッチHID�
 有効化します。`include/iqs9150/diagnostics.h` のRAM取得APIは採取時刻とmode別report累計を
 返し、I2Cや復帰要求を行いません。Event Modeの無通信中は値が古くなり、現在modeの問い合わせ
 や滞在時間の計測にはなりません。診断は既定無効で、ALP設定を調整しません。
+
+切り分け用の `diagnostic-disable-lp2-autoprox` はLP2 Auto-Prox有効bitのみ0にして、
+ATI前にOther Settings全wordを確認します。LP2移行と他ALP設定は変更しません。
+既定は未指定で、sleep自体を無効化する設定ではありません。
 
 runtime復旧コマンドは、[IQS9150/IQS9151データシート](https://www.azoteq.com/images/stories/pdf/IQS9150_IQS9151_datasheet.pdf)に従って
 System Controlのbit 9（`0x0200`）を使います。通信終了フラグはConfig Settingsの
