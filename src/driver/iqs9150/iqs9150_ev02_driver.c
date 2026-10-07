@@ -24,6 +24,7 @@
 
 #include "iqs9150_ev02_init.h"
 #include <travelers_pad/multitouch.h>
+#include <iqs9150/diagnostics.h>
 
 LOG_MODULE_REGISTER(iqs9150_ev02_driver, CONFIG_IQS9150_EV02_DRIVER_LOG_LEVEL);
 
@@ -99,6 +100,7 @@ enum iqs9150_state {
 	IQS9150_RECOVER_WAIT_RESET,
 	IQS9150_ERROR,
 	IQS9150_VERIFY_MODE_TIMEOUTS,
+	IQS9150_READ_POWER_SETUP,
 };
 
 struct iqs9150_config {
@@ -109,11 +111,15 @@ struct iqs9150_config {
 	bool diagnostic_disable_mode_timeouts;
 	bool diagnostic_disable_lp_entry;
 	uint8_t power_mode_limit;
+	bool power_diagnostics;
  uint16_t rdy_watch_ms;
  bool runtime_diagnostics;
 };
 
 struct iqs9150_data {
+	struct k_spinlock power_lock;
+	struct iqs9150_power_observation power_observation;
+	uint8_t power_setup_phase;
 	const struct device *dev;
 	struct gpio_callback rdy_callback;
 	struct k_work_delayable work;
@@ -332,6 +338,28 @@ static uint8_t contact_representative(const struct iqs9150_contact *contacts,
 	return TRAVELERS_PAD_MAX_CONTACTS;
 }
 
+static void iqs9150_observe_power(struct iqs9150_data *data, uint16_t flags)
+{
+	/* All-EEEE is an invalid/out-of-window reply, not mode 6. */
+	if (flags == 0xeeee) return;
+	k_spinlock_key_t key = k_spin_lock(&data->power_lock);
+	data->power_observation.sampled_ms = k_uptime_get();
+	data->power_observation.info_flags = flags;
+	data->power_observation.mode_reports[flags & 7]++;
+	k_spin_unlock(&data->power_lock, key);
+}
+
+int iqs9150_get_power_observation(const struct device *dev,
+				struct iqs9150_power_observation *out)
+{
+	if (dev == NULL || out == NULL) return -EINVAL;
+	struct iqs9150_data *data = dev->data;
+	k_spinlock_key_t key = k_spin_lock(&data->power_lock);
+	*out = data->power_observation;
+	k_spin_unlock(&data->power_lock, key);
+	return 0;
+}
+
 static void report_contact_frame(const struct device *dev)
 {
 	struct iqs9150_data *data = dev->data;
@@ -362,6 +390,7 @@ static void report_contact_frame(const struct device *dev)
 		return;
 	}
 	data->report_error_count = 0;
+	if (cfg->power_diagnostics) iqs9150_observe_power(data, le16(&report[12]));
  data->reports_read++;
  data->last_report_ms = k_uptime_get();
 	if (le16(&report[12]) & IQS9150_INFO_SHOW_RESET) {
@@ -539,7 +568,8 @@ static void iqs9150_work_handler(struct k_work *work)
 	int active = gpio_pin_get_dt(&((const struct iqs9150_config *)dev->config)->rdy_gpio);
 
 	if ((data->state == IQS9150_WAIT_PRODUCT || data->state == IQS9150_READ_COMMS_CONFIG ||
-	     data->state == IQS9150_VERIFY_MODE_TIMEOUTS) &&
+	     data->state == IQS9150_VERIFY_MODE_TIMEOUTS ||
+	     data->state == IQS9150_READ_POWER_SETUP) &&
 	    active != 1) {
 		if (active < 0) {
 			iqs9150_fail(data, "startup RDY read", active);
@@ -665,7 +695,9 @@ static void iqs9150_work_handler(struct k_work *work)
 
 		if (data->block_index == ARRAY_SIZE(ev02_blocks)) {
 			data->state = iqs9150_timeout_patch_reg(cfg) != 0 ?
-				IQS9150_VERIFY_MODE_TIMEOUTS : IQS9150_START_ATI;
+				IQS9150_VERIFY_MODE_TIMEOUTS :
+				cfg->power_diagnostics ? IQS9150_READ_POWER_SETUP : IQS9150_START_ATI;
+			data->power_setup_phase = 0;
 			data->comms_request_attempts = 0;
 			if (iqs9150_timeout_patch_reg(cfg) != 0) {
 				LOG_INF("STEP1B initialization data written; verifying diagnostic mode timeouts");
@@ -731,7 +763,34 @@ static void iqs9150_work_handler(struct k_work *work)
 		} else {
 			LOG_INF("power limit lp1: LP1-to-LP2 timeout verified zero; Active/Idle/LP1 transitions retained");
 		}
-		data->state = IQS9150_START_ATI;
+		data->state = cfg->power_diagnostics ? IQS9150_READ_POWER_SETUP : IQS9150_START_ATI;
+		return;
+	}
+
+	case IQS9150_READ_POWER_SETUP: {
+		uint8_t setup[26];
+		uint16_t reg = data->power_setup_phase == 0 ? 0x11a2 : 0x11be;
+		rc = read_reg(dev, reg, setup, sizeof(setup));
+		if (rc != 0) { iqs9150_fail(data, "power setup readback", rc); return; }
+		rc = terminate_comms_if_needed(data);
+		if (rc != 0) { iqs9150_fail(data, "power setup termination", rc); return; }
+		bool empty = true;
+		for (size_t i = 0; i < sizeof(setup); i++) empty &= setup[i] == 0xee;
+		if (empty) { iqs9150_fail(data, "power setup empty window", -EIO); return; }
+		if (data->power_setup_phase == 0) {
+			LOG_INF("power setup: sample-ms=%u/%u/%u/%u/%u timeout=%u/%u/%u/%u active-idle-ms=%u ref-seconds=%u",
+				le16(setup), le16(setup+2), le16(setup+4), le16(setup+6), le16(setup+8),
+				le16(setup+10), le16(setup+12), le16(setup+14), le16(setup+16), le16(setup+18), setup[21]);
+			data->power_setup_phase = 1;
+		} else {
+			LOG_INF("power setup: config=0x%04x other=0x%04x alp=0x%02x%02x%02x%02x alp-enabled=%u lp1-autoprox=%u lp2-autoprox=%u threshold=%u/%u debounce=%u/%u filter=%u/%u/%u/%u",
+				le16(setup), le16(setup+2), setup[7], setup[6], setup[5], setup[4],
+				!!(setup[7]&BIT(7)), !!(setup[2]&BIT(4)), !!(setup[2]&BIT(5)),
+				setup[16], setup[17], setup[18], setup[19], setup[22], setup[23], setup[24], setup[25]);
+			LOG_INF("power setup: alp-tx=%02x/%02x/%02x/%02x/%02x/%02x; passive mode observation enabled",
+				setup[8],setup[9],setup[10],setup[11],setup[12],setup[13]);
+			data->state = IQS9150_START_ATI;
+		}
 		return;
 	}
 
@@ -1010,6 +1069,7 @@ static int iqs9150_init(const struct device *dev)
 		.diagnostic_disable_mode_timeouts = DT_INST_PROP_OR(inst, diagnostic_disable_mode_timeouts, false), \
 		.diagnostic_disable_lp_entry = DT_INST_PROP_OR(inst, diagnostic_disable_lp_entry, false), \
 		.power_mode_limit = DT_INST_ENUM_IDX(inst, power_mode_limit), \
+		.power_diagnostics = DT_INST_PROP(inst, power_diagnostics), \
   .rdy_watch_ms = DT_INST_PROP_OR(inst, rdy_watch_ms, 250), \
   .runtime_diagnostics = DT_INST_PROP(inst, runtime_diagnostics), \
 	}; \

@@ -122,6 +122,13 @@ Public frame definitions are in `include/travelers_pad/multitouch.h`.
 
 ### Startup and troubleshooting
 
+`power-diagnostics` enables startup power/ALP configuration readback and passive
+Info Flags observations from existing reports. The cached-only API in
+`include/iqs9150/diagnostics.h` returns observation time and mode report counters
+without I2C or wake requests. With Event Mode silence the observation can be
+stale; it is not a live query or a measure of time spent in a mode. Diagnostic
+observation is disabled by default and does not tune ALP settings.
+
 The runtime recovery command uses System Control bit 9 (`0x0200`), as specified
 in the [IQS9150/IQS9151 datasheet](https://www.azoteq.com/images/stories/pdf/IQS9150_IQS9151_datasheet.pdf).
 The communication-termination flag is Configuration Settings bit 6 in the low
@@ -274,6 +281,11 @@ driverはZephyr input eventを出力し、ホスト向けマルチタッチHID�
 | `ABS_RZ` | センサーreset通知 |
 
 ### 起動とトラブルシューティング
+
+`power-diagnostics` で起動時の電源/ALP設定readbackと、通常report内のInfo Flags受動採取を
+有効化します。`include/iqs9150/diagnostics.h` のRAM取得APIは採取時刻とmode別report累計を
+返し、I2Cや復帰要求を行いません。Event Modeの無通信中は値が古くなり、現在modeの問い合わせ
+や滞在時間の計測にはなりません。診断は既定無効で、ALP設定を調整しません。
 
 runtime復旧コマンドは、[IQS9150/IQS9151データシート](https://www.azoteq.com/images/stories/pdf/IQS9150_IQS9151_datasheet.pdf)に従って
 System Controlのbit 9（`0x0200`）を使います。通信終了フラグはConfig Settingsの

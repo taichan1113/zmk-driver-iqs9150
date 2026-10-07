@@ -5,6 +5,14 @@ compatible: "azoteq,iqs9150"
 include: i2c-device.yaml
 
 properties:
+  power-diagnostics:
+    type: boolean
+    description: |
+      Read mode/ALP configuration before ATI and cache Info Flags from ordinary
+      runtime reports. Cached observations never force I2C or wake the sensor;
+      a stale value is not the current mode. No configuration tuning is performed.
+      ATI前にmode/ALP設定を採取し、通常reportのInfo FlagsをRAM保存する。
+      runtimeの追加通信・強制復帰は行わない。古い採取値は現在modeではない。
   power-mode-limit:
     type: string
     default: "none"
