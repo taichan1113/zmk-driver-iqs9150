@@ -39,6 +39,7 @@ LOG_MODULE_REGISTER(iqs9150_ev02_driver, CONFIG_IQS9150_EV02_DRIVER_LOG_LEVEL);
 #define IQS9150_LP1_TIMEOUT_REG           0x11B2
 #define IQS9150_OTHER_SETTINGS_REG        0x11C0
 #define IQS9150_LP2_AUTOPROX_ENABLE       BIT(5)
+#define IQS9150_ALP_ENABLE_BYTE_REG      0x11C5
 #define IQS9150_POWER_LIMIT_NONE          0
 #define IQS9150_POWER_LIMIT_ACTIVE        1
 #define IQS9150_POWER_LIMIT_IDLE          2
@@ -115,6 +116,7 @@ struct iqs9150_config {
 	uint8_t power_mode_limit;
 	bool power_diagnostics;
 	bool diagnostic_disable_lp2_autoprox;
+	bool diagnostic_disable_alp;
  uint16_t rdy_watch_ms;
  bool runtime_diagnostics;
 };
@@ -123,6 +125,7 @@ struct iqs9150_data {
 	struct k_spinlock power_lock;
 	struct iqs9150_power_observation power_observation;
 	uint8_t power_setup_phase;
+	bool final_power_verification;
 	const struct device *dev;
 	struct gpio_callback rdy_callback;
 	struct k_work_delayable work;
@@ -534,6 +537,9 @@ static void iqs9150_init_payload(const struct iqs9150_config *cfg, uint16_t reg,
 		if (cfg->diagnostic_disable_lp2_autoprox && address == IQS9150_OTHER_SETTINGS_REG) {
 			payload[i] &= ~IQS9150_LP2_AUTOPROX_ENABLE;
 		}
+		if (cfg->diagnostic_disable_alp && address == IQS9150_ALP_ENABLE_BYTE_REG) {
+			payload[i] &= ~BIT(7);
+		}
 	}
 }
 
@@ -701,9 +707,10 @@ static void iqs9150_work_handler(struct k_work *work)
 		if (data->block_index == ARRAY_SIZE(ev02_blocks)) {
 			data->state = iqs9150_timeout_patch_reg(cfg) != 0 ?
 				IQS9150_VERIFY_MODE_TIMEOUTS :
-				(cfg->power_diagnostics || cfg->diagnostic_disable_lp2_autoprox) ?
+				(cfg->power_diagnostics || cfg->diagnostic_disable_lp2_autoprox || cfg->diagnostic_disable_alp) ?
 				IQS9150_READ_POWER_SETUP : IQS9150_START_ATI;
 			data->power_setup_phase = 0;
+			data->final_power_verification = false;
 			data->comms_request_attempts = 0;
 			if (iqs9150_timeout_patch_reg(cfg) != 0) {
 				LOG_INF("STEP1B initialization data written; verifying diagnostic mode timeouts");
@@ -769,7 +776,7 @@ static void iqs9150_work_handler(struct k_work *work)
 		} else {
 			LOG_INF("power limit lp1: LP1-to-LP2 timeout verified zero; Active/Idle/LP1 transitions retained");
 		}
-		data->state = (cfg->power_diagnostics || cfg->diagnostic_disable_lp2_autoprox) ?
+		data->state = (cfg->power_diagnostics || cfg->diagnostic_disable_lp2_autoprox || cfg->diagnostic_disable_alp) ?
 			IQS9150_READ_POWER_SETUP : IQS9150_START_ATI;
 		return;
 	}
@@ -790,6 +797,18 @@ static void iqs9150_work_handler(struct k_work *work)
 				le16(setup+10), le16(setup+12), le16(setup+14), le16(setup+16), le16(setup+18), setup[21]);
 			data->power_setup_phase = 1;
 		} else {
+			if (cfg->diagnostic_disable_alp) {
+				if (memcmp(setup+4, ev02_11c2, 3) != 0 ||
+				    setup[7] != (ev02_11c2[3] & ~BIT(7))) {
+					iqs9150_fail(data, "ALP disable setup verification", -EIO); return;
+				}
+				/* Keep Auto-Prox settings unchanged for this isolated comparison. */
+				if (!cfg->diagnostic_disable_lp2_autoprox &&
+				    le16(setup+2) != ((uint16_t)OTHER_SETTINGS_0 | ((uint16_t)OTHER_SETTINGS_1 << 8))) {
+					iqs9150_fail(data, "ALP off Other Settings preservation", -EIO); return;
+				}
+				LOG_INF("diagnostic ALP disabled: complete ALP Setup verified; trackpad sensing in LP1/LP2");
+			}
 			if (cfg->diagnostic_disable_lp2_autoprox) {
 				uint16_t expected = (OTHER_SETTINGS_0 & ~IQS9150_LP2_AUTOPROX_ENABLE) |
 					((uint16_t)OTHER_SETTINGS_1 << 8);
@@ -805,7 +824,13 @@ static void iqs9150_work_handler(struct k_work *work)
 				setup[16], setup[17], setup[18], setup[19], setup[22], setup[23], setup[24], setup[25]);
 			LOG_INF("power setup: alp-tx=%02x/%02x/%02x/%02x/%02x/%02x; passive-observation=%u",
 				setup[8],setup[9],setup[10],setup[11],setup[12],setup[13], cfg->power_diagnostics);
-			data->state = IQS9150_START_ATI;
+			if (data->final_power_verification) {
+				data->state = IQS9150_RUNNING;
+				LOG_INF("final power setup verified after Event Mode enable");
+				LOG_INF("STEP1B complete: Event Mode active; touch the pad to produce reports");
+			} else {
+				data->state = IQS9150_START_ATI;
+			}
 		}
 		return;
 	}
@@ -875,9 +900,9 @@ static void iqs9150_work_handler(struct k_work *work)
 	case IQS9150_ENABLE_EVENT_MODE:
 		value[0] = CONFIG_SETTINGS_0;
 		value[1] = CONFIG_SETTINGS_1 | BIT(0);
-		value[2] = OTHER_SETTINGS_0;
-		value[3] = OTHER_SETTINGS_1;
-		rc = write_reg(dev, IQS9150_CONFIG_SETTINGS_REG, value, sizeof(value));
+		/* Only Config Settings: do not overwrite adjacent Other Settings and
+		 * silently undo the diagnostic Auto-Prox policy after its readback. */
+		rc = write_reg(dev, IQS9150_CONFIG_SETTINGS_REG, value, 2);
 		if (rc != 0) {
 			iqs9150_fail(data, "Event Mode enable", rc);
 			return;
@@ -890,6 +915,12 @@ static void iqs9150_work_handler(struct k_work *work)
 		}
 		data->state = IQS9150_RUNNING;
 		data->ati_recovery_attempts = 0;
+		if (cfg->power_diagnostics || cfg->diagnostic_disable_lp2_autoprox || cfg->diagnostic_disable_alp) {
+			data->power_setup_phase = 1;
+			data->final_power_verification = true;
+			data->state = IQS9150_READ_POWER_SETUP;
+			return;
+		}
 		LOG_INF("STEP1B complete: Event Mode active; touch the pad to produce reports");
 		return;
 
@@ -1087,6 +1118,7 @@ static int iqs9150_init(const struct device *dev)
 		.power_mode_limit = DT_INST_ENUM_IDX(inst, power_mode_limit), \
 		.power_diagnostics = DT_INST_PROP(inst, power_diagnostics), \
 		.diagnostic_disable_lp2_autoprox = DT_INST_PROP(inst, diagnostic_disable_lp2_autoprox), \
+		.diagnostic_disable_alp = DT_INST_PROP(inst, diagnostic_disable_alp), \
   .rdy_watch_ms = DT_INST_PROP_OR(inst, rdy_watch_ms, 250), \
   .runtime_diagnostics = DT_INST_PROP(inst, runtime_diagnostics), \
 	}; \

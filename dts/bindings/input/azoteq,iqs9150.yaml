@@ -5,6 +5,15 @@ compatible: "azoteq,iqs9150"
 include: i2c-device.yaml
 
 properties:
+  diagnostic-disable-alp:
+    type: boolean
+    description: |
+      Diagnostic only: clear ALP Setup bit 31 (0x11C5 bit7), selecting trackpad
+      sensing in LP1/LP2. Preserve electrode bits, mode timeouts and Auto-Prox
+      settings. Verify complete ALP Setup and unchanged Other Settings before
+      ATI and after Event Mode enable. Default absent keeps bundled ALP policy.
+      診断専用：ALP有効bitだけ0にし、LP1/LP2でtrackpad sensingを選ぶ。
+      ATI前とEvent Mode有効化後にALP SetupとOther Settingsを確認する。
   diagnostic-disable-lp2-autoprox:
     type: boolean
     description: |

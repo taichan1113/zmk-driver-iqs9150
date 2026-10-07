@@ -134,6 +134,11 @@ LP2 Auto-Prox enable bit and verifies the complete Other Settings word before
 ATI. It leaves LP2 entry and all other ALP settings unchanged. It is absent by
 default and is not a general-purpose sleep-disable switch.
 
+`diagnostic-disable-alp` clears only ALP Enable, selecting trackpad sensing in
+LP1/LP2. It preserves the mode timeouts and Auto-Prox settings. Both diagnostic
+policies require readback before ATI and after Event Mode enable; startup fails
+on mismatch. Event Mode writes only Config Settings, not adjacent Other Settings.
+
 The runtime recovery command uses System Control bit 9 (`0x0200`), as specified
 in the [IQS9150/IQS9151 datasheet](https://www.azoteq.com/images/stories/pdf/IQS9150_IQS9151_datasheet.pdf).
 The communication-termination flag is Configuration Settings bit 6 in the low
@@ -295,6 +300,10 @@ driverはZephyr input eventを出力し、ホスト向けマルチタッチHID�
 切り分け用の `diagnostic-disable-lp2-autoprox` はLP2 Auto-Prox有効bitのみ0にして、
 ATI前にOther Settings全wordを確認します。LP2移行と他ALP設定は変更しません。
 既定は未指定で、sleep自体を無効化する設定ではありません。
+
+`diagnostic-disable-alp` はALP有効bitだけ0にしてLP1/LP2でtrackpad sensingを選びます。
+mode timeoutとAuto-Proxは維持。両比較設定はATI前とEvent Mode有効化後にreadback確認し、
+不一致なら起動を止めます。Event Modeでは隣接Other Settingsを上書きせずConfigだけ書きます。
 
 runtime復旧コマンドは、[IQS9150/IQS9151データシート](https://www.azoteq.com/images/stories/pdf/IQS9150_IQS9151_datasheet.pdf)に従って
 System Controlのbit 9（`0x0200`）を使います。通信終了フラグはConfig Settingsの
