@@ -151,6 +151,14 @@ struct iqs9150_data {
 	bool multitouch_slot_active[TRAVELERS_PAD_MAX_CONTACTS];
 	uint8_t representative_slot;
 	bool representative_valid;
+#if CONFIG_IQS9150_CONTACT_DIAGNOSTICS
+	bool contact_diagnostic_seen;
+	uint8_t contact_diagnostic_raw_count;
+	uint8_t contact_diagnostic_mask;
+	uint8_t contact_diagnostic_confidence;
+	uint8_t contact_diagnostic_coordinates;
+	int64_t contact_diagnostic_ms;
+#endif
 	size_t block_index;
 	size_t block_offset;
 };
@@ -344,6 +352,38 @@ static uint8_t contact_representative(const struct iqs9150_contact *contacts,
 	return TRAVELERS_PAD_MAX_CONTACTS;
 }
 
+#if CONFIG_IQS9150_CONTACT_DIAGNOSTICS
+static void observe_contact_report(struct iqs9150_data *data, uint16_t info,
+				   uint16_t flags, uint8_t decoded,
+				   const struct iqs9150_contact *contacts)
+{
+	uint8_t raw_count = flags & IQS9150_TP_FINGER_COUNT_MASK;
+	uint8_t mask = 0, confidence = 0, coordinates = 0;
+	int64_t now = k_uptime_get();
+	for (uint8_t i = 0; i < TRAVELERS_PAD_MAX_CONTACTS; i++) {
+		if (contacts[i].valid) mask |= BIT(i);
+		if (flags & IQS9150_TP_FINGER_CONFIDENCE(i)) confidence |= BIT(i);
+		if (contacts[i].x != UINT16_MAX && contacts[i].y != UINT16_MAX)
+			coordinates |= BIT(i);
+	}
+	if (!data->contact_diagnostic_seen || raw_count != data->contact_diagnostic_raw_count ||
+	    mask != data->contact_diagnostic_mask ||
+	    confidence != data->contact_diagnostic_confidence ||
+	    coordinates != data->contact_diagnostic_coordinates ||
+	    ((raw_count || decoded) && now - data->contact_diagnostic_ms >= 1000)) {
+		LOG_INF("contact sensor report=%u info=0x%04x flags=0x%04x raw=%u decoded=%u mask=0x%02x confidence=0x%02x coordinates=0x%02x slot0=(%u,%u) slot1=(%u,%u)",
+			data->reports_read, info, flags, raw_count, decoded, mask, confidence,
+			coordinates, contacts[0].x, contacts[0].y, contacts[1].x, contacts[1].y);
+		data->contact_diagnostic_ms = now;
+	}
+	data->contact_diagnostic_seen = true;
+	data->contact_diagnostic_raw_count = raw_count;
+	data->contact_diagnostic_mask = mask;
+	data->contact_diagnostic_confidence = confidence;
+	data->contact_diagnostic_coordinates = coordinates;
+}
+#endif
+
 static void iqs9150_observe_power(struct iqs9150_data *data, uint16_t flags)
 {
 	/* All-EEEE is an invalid/out-of-window reply, not mode 6. */
@@ -406,6 +446,9 @@ static void report_contact_frame(const struct device *dev)
 
 	trackpad_flags = le16(&report[14]);
 	fingers = decode_contact_slots(report, trackpad_flags, contacts);
+#if CONFIG_IQS9150_CONTACT_DIAGNOSTICS
+	observe_contact_report(data, le16(&report[12]), trackpad_flags, fingers, contacts);
+#endif
 
 	LOG_DBG("status=0x%04x tp=0x%04x fingers=%u rel=(%d,%d) f1=(%u,%u,%d) f2=(%u,%u,%d)",
 		le16(&report[12]), trackpad_flags, fingers, (int16_t)le16(&report[0]),

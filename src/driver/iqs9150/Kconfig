@@ -10,6 +10,14 @@ menuconfig IQS9150_EV02_DRIVER
 
 if IQS9150_EV02_DRIVER
 
+config IQS9150_CONTACT_DIAGNOSTICS
+    bool "Trace sensor contact flags before normalization"
+    default n
+    help
+      Observe already-read sensor reports on count/slot-mask transitions and
+      once per second while contacts remain present. No extra I2C reads are
+      performed. Disable after diagnosis to reduce serial logging overhead.
+
 module = IQS9150_EV02_DRIVER
 module-str = iqs9150_ev02_driver
 source "subsys/logging/Kconfig.template.log_config"
