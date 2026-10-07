@@ -919,6 +919,11 @@ static void iqs9150_work_handler(struct k_work *work)
 			data->power_setup_phase = 1;
 			data->final_power_verification = true;
 			data->state = IQS9150_READ_POWER_SETUP;
+			/* Event Mode may remain silent until touch. Request a bounded
+			 * startup window instead of waiting for a new RDY interrupt.
+			 * 接触を待たず、起動時限定の通信窓要求で最終確認する。 */
+			data->comms_request_attempts = 0;
+			k_work_schedule(&data->work, K_NO_WAIT);
 			return;
 		}
 		LOG_INF("STEP1B complete: Event Mode active; touch the pad to produce reports");
