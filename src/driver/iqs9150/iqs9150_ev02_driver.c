@@ -34,6 +34,7 @@ LOG_MODULE_REGISTER(iqs9150_ev02_driver, CONFIG_IQS9150_EV02_DRIVER_LOG_LEVEL);
 #define IQS9150_CONFIG_SETTINGS_REG       0x11BE
 #define IQS9150_MODE_TIMEOUT_FIRST_REG    0x11AC
 #define IQS9150_MODE_TIMEOUT_BYTES        10
+#define IQS9150_IDLE_TIMEOUT_REG          0x11B0
 #define IQS9150_TERMINATE_COMMS_REG        0xEEEE
 
 #define IQS9150_PRODUCT_NUMBER            0x076A
@@ -101,6 +102,7 @@ struct iqs9150_config {
 	bool two_finger_diagnostics;
 	bool multitouch_diagnostics;
 	bool diagnostic_disable_mode_timeouts;
+	bool diagnostic_disable_lp_entry;
  uint16_t rdy_watch_ms;
  bool runtime_diagnostics;
 };
@@ -466,11 +468,14 @@ static void iqs9150_init_payload(const struct iqs9150_config *cfg, uint16_t reg,
 				const uint8_t *source, uint8_t *payload, size_t len)
 {
 	memcpy(payload, source, len);
-	if (!cfg->diagnostic_disable_mode_timeouts) return;
+	if (!cfg->diagnostic_disable_mode_timeouts && !cfg->diagnostic_disable_lp_entry) return;
 	for (size_t i = 0; i < len; i++) {
 		uint32_t address = (uint32_t)reg + i;
-		if (address >= IQS9150_MODE_TIMEOUT_FIRST_REG &&
-		    address < IQS9150_MODE_TIMEOUT_FIRST_REG + IQS9150_MODE_TIMEOUT_BYTES) {
+		if ((cfg->diagnostic_disable_mode_timeouts &&
+		     address >= IQS9150_MODE_TIMEOUT_FIRST_REG &&
+		     address < IQS9150_MODE_TIMEOUT_FIRST_REG + IQS9150_MODE_TIMEOUT_BYTES) ||
+		    (cfg->diagnostic_disable_lp_entry &&
+		     address >= IQS9150_IDLE_TIMEOUT_REG && address < IQS9150_IDLE_TIMEOUT_REG + 2)) {
 			payload[i] = 0;
 		}
 	}
@@ -637,10 +642,10 @@ static void iqs9150_work_handler(struct k_work *work)
 		uint8_t payload[IQS9150_WRITE_PAYLOAD_MAX];
 
 		if (data->block_index == ARRAY_SIZE(ev02_blocks)) {
-			data->state = cfg->diagnostic_disable_mode_timeouts ?
+			data->state = (cfg->diagnostic_disable_mode_timeouts || cfg->diagnostic_disable_lp_entry) ?
 				IQS9150_VERIFY_MODE_TIMEOUTS : IQS9150_START_ATI;
 			data->comms_request_attempts = 0;
-			if (cfg->diagnostic_disable_mode_timeouts) {
+			if (cfg->diagnostic_disable_mode_timeouts || cfg->diagnostic_disable_lp_entry) {
 				LOG_INF("STEP1B initialization data written; verifying diagnostic mode timeouts");
 			} else {
 				LOG_INF("STEP1B initialization data written; starting ATI");
@@ -679,7 +684,10 @@ static void iqs9150_work_handler(struct k_work *work)
 
 	case IQS9150_VERIFY_MODE_TIMEOUTS: {
 		uint8_t timeouts[IQS9150_MODE_TIMEOUT_BYTES];
-		rc = read_reg(dev, IQS9150_MODE_TIMEOUT_FIRST_REG, timeouts, sizeof(timeouts));
+		uint16_t reg = cfg->diagnostic_disable_mode_timeouts ?
+			IQS9150_MODE_TIMEOUT_FIRST_REG : IQS9150_IDLE_TIMEOUT_REG;
+		size_t len = cfg->diagnostic_disable_mode_timeouts ? sizeof(timeouts) : 2;
+		rc = read_reg(dev, reg, timeouts, len);
 		if (rc != 0) {
 			iqs9150_fail(data, "diagnostic mode timeout readback", rc);
 			return;
@@ -689,13 +697,17 @@ static void iqs9150_work_handler(struct k_work *work)
 			iqs9150_fail(data, "diagnostic timeout communication termination", rc);
 			return;
 		}
-		for (size_t i = 0; i < sizeof(timeouts); i++) {
+		for (size_t i = 0; i < len; i++) {
 			if (timeouts[i] != 0) {
 				iqs9150_fail(data, "diagnostic mode timeout verification", -EIO);
 				return;
 			}
 		}
-		LOG_INF("diagnostic active-only: five mode timeouts verified zero; automatic reference management retained");
+		if (cfg->diagnostic_disable_mode_timeouts) {
+			LOG_INF("diagnostic active-only: five mode timeouts verified zero; automatic reference management retained");
+		} else {
+			LOG_INF("diagnostic idle-only: Idle-to-LP1 timeout verified zero; Active/Idle transitions retained");
+		}
 		data->state = IQS9150_START_ATI;
 		return;
 	}
@@ -973,6 +985,7 @@ static int iqs9150_init(const struct device *dev)
 		.two_finger_diagnostics = DT_INST_PROP_OR(inst, two_finger_diagnostics, false), \
 		.multitouch_diagnostics = DT_INST_PROP_OR(inst, multitouch_diagnostics, false), \
 		.diagnostic_disable_mode_timeouts = DT_INST_PROP_OR(inst, diagnostic_disable_mode_timeouts, false), \
+		.diagnostic_disable_lp_entry = DT_INST_PROP_OR(inst, diagnostic_disable_lp_entry, false), \
   .rdy_watch_ms = DT_INST_PROP_OR(inst, rdy_watch_ms, 250), \
   .runtime_diagnostics = DT_INST_PROP(inst, runtime_diagnostics), \
 	}; \

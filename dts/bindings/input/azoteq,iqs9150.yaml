@@ -5,6 +5,15 @@ compatible: "azoteq,iqs9150"
 include: i2c-device.yaml
 
 properties:
+  diagnostic-disable-lp-entry:
+    type: boolean
+    description: |
+      Diagnostic only: zero the Idle-to-LP1 timeout word at 0x11B0 and verify
+      readback before ATI. Retain Active/Idle Touch/Idle transitions, sampling
+      and automatic reference management. Leave diagnostic-disable-mode-timeouts
+      absent for this comparison; if both are set, active-only takes precedence.
+      診断専用：IdleからLP1へのtimeoutのみ0にし、ATI前にreadback確認する。
+      他のmode timeoutとsampling・自動reference管理は維持する。
   diagnostic-disable-mode-timeouts:
     type: boolean
     description: |
