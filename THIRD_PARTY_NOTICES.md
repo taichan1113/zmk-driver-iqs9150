@@ -10,18 +10,21 @@ remain in force.
 
 - File: `src/driver/iqs9150/iqs9150_ev02_init.h`
 - Origin: user-supplied IQS9150 GUI H-file; the header credits Azoteq.
-- License status: redistribution terms are unconfirmed. This file is excluded
-  from the project's MIT grant.
+- Permission status: on 2026-11-08 the repository maintainer confirmed that
+  permission for public redistribution of the bundled data had been obtained.
+  This file remains excluded from the project's MIT grant.
 
 The official example package and GUI header reviewed on 2026-10-06 did not
 provide an identifiable MIT, BSD, or Apache license grant for these settings.
 The website's [Terms of Use](https://www.azoteq.com/images/stories/pdf/Azoteq-Terms-of-Use.pdf)
 state that software downloads are subject to the associated EULA. The exact
-terms applicable to this user-supplied H-file still need confirmation from Azoteq.
+permission confirmation above was subsequently provided by the maintainer;
+it does not establish an MIT, BSD, or Apache license for these settings.
 
-Public redistribution of this file, its Git history, or firmware containing
-its data requires a separate rights review before release. This notice records
-attribution and status; it is not permission to redistribute.
+This notice records attribution and the maintainer's permission confirmation.
+It does not independently grant downstream rights or reproduce the permission
+terms. Before further redistribution of source or firmware containing these
+settings, confirm the applicable permission scope with the maintainer.
 
 Official resources:
 
@@ -37,15 +40,18 @@ Official resources:
 
 - ファイル: `src/driver/iqs9150/iqs9150_ev02_init.h`
 - 由来: ユーザー提供のIQS9150 GUI H-file。ヘッダにはAzoteqの原作者表記があります。
-- ライセンス状況: 再配布条件は未確認です。本プロジェクトのMIT許諾対象外です。
+- 許諾状況: 2026-11-08に、管理者が同梱データの公開再配布許諾を取得済みであることを確認しました。
+  本プロジェクトのMIT許諾対象外であることは変わりません。
 
 2026-10-06に確認した公式サンプルとGUIヘッダから、この設定に適用されるMIT・BSD・Apache
 ライセンスは確認できませんでした。公式サイトの[利用規約](https://www.azoteq.com/images/stories/pdf/Azoteq-Terms-of-Use.pdf)
 では、ソフトウェアのダウンロードは個別EULAの対象とされています。
-今回のユーザー提供H-fileに適用される条件は、Azoteqへの確認が必要です。
+その後、管理者から上記の許諾取得の確認を受けました。
+これは初期化設定へのMIT・BSD・Apacheライセンス適用を意味しません。
 
-このファイル、Git履歴上のコピー、または設定データを含むファームウェアの公開再配布には、
-公開前に権利確認が必要です。この文書は帰属と調査状況の記録であり、再配布許諾ではありません。
+この文書は帰属と管理者による許諾取得確認の記録です。許諾条件本文を転載するものでも、
+第三者に独自に再配布権を許諾するものでもありません。設定を含むソースやファームウェアを
+さらに再配布する場合は、適用される許諾の範囲を管理者に確認してください。
 
 公式資料:
 

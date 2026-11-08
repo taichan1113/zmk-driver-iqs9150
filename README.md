@@ -172,7 +172,8 @@ from logs.
 
 Original project contributions are licensed under the MIT License in
 [`LICENSE`](LICENSE). The Azoteq-derived initialization settings are not
-covered by that grant because their redistribution terms have not been confirmed.
+covered by that grant. On 2026-11-08 the repository maintainer confirmed that
+permission for public redistribution of the bundled data had been obtained.
 Read [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) before redistributing
 source or firmware.
 
@@ -333,5 +334,6 @@ driverは起動時に同梱EV02設定を書き込みます。初期化とATIキ�
 ### ライセンスと第三者由来の内容
 
 本プロジェクト独自の成果は[`LICENSE`](LICENSE)に記載したMIT Licenseです。
-Azoteq由来の初期化設定は再配布条件が未確認のため、この許諾対象には含まれません。
+Azoteq由来の初期化設定は本プロジェクトのMIT許諾対象には含まれません。
+2026-11-08に、管理者が同梱データの公開再配布許諾を取得済みであることを確認しました。
 ソースやファームウェアを再配布する前に[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)を確認してください。
